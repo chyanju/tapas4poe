@@ -15,21 +15,22 @@
 # Lint as: python3
 """Script for creating TF examples, training and evaluation."""
 
-import dataclasses
 import enum
 import functools
+import itertools
 import os
 import random
 import time
-from typing import Mapping, Optional, Text
+import pickle
+from typing import Text, Optional
 
 from absl import app
 from absl import flags
 from absl import logging
+import dataclasses
 from tapas.experiments import prediction_utils as exp_prediction_utils
 from tapas.models import tapas_classifier_model
 from tapas.models.bert import modeling
-from tapas.retrieval import e2e_eval_utils
 from tapas.scripts import calc_metrics_utils
 from tapas.scripts import prediction_utils
 from tapas.utils import file_utils
@@ -123,28 +124,6 @@ flags.DEFINE_bool('reset_position_index_per_cell', False,
 flags.DEFINE_bool('prune_columns', False,
                   'Use word overlap heuristics to keep most relevant columns.')
 
-flags.DEFINE_bool(
-    'reset_output_cls',
-    False,
-    'If true, reset classification output layer on init from checkpoint. This '
-    'is useful when fine-tuning a classifier model from a model pre-trained '
-    'with a different number of classes.',
-)
-
-flags.DEFINE_boolean('use_document_title', False,
-                     'Use table title to encode the input.')
-
-flags.DEFINE_boolean('update_answer_coordinates', False,
-                     'Re-computes answer coordinates from the answer text.')
-
-flags.DEFINE_boolean(
-    'drop_rows_to_fit', False,
-    'Drop last rows if table does not fit within max sequence '
-    'length.')
-
-flags.DEFINE_string('table_pruning_config_file', None,
-                    'Table pruning config file.')
-
 _MAX_TABLE_ID = 512
 _MAX_PREDICTIONS_PER_SEQ = 20
 _CELL_CLASSIFICATION_THRESHOLD = 0.5
@@ -172,19 +151,6 @@ class TpuOptions:
   master: Optional[Text]
   num_tpu_cores: int
   iterations_per_loop: int
-
-
-def _create_measurements_for_metrics(
-    metrics,
-    global_step,
-    model_dir,
-    name,
-):
-  """Reports metrics."""
-  for label, value in metrics.items():
-    _print(f'{name} {label}: {value:0.4f}')
-  logdir = os.path.join(model_dir, name)
-  calc_metrics_utils.write_to_tensorboard(metrics, global_step, logdir)
 
 
 def _print(msg):
@@ -252,9 +218,6 @@ def _create_examples(
   config = tf_example_utils.ClassifierConversionConfig(
       vocab_file=vocab_file,
       max_seq_length=FLAGS.max_seq_length,
-      use_document_title=FLAGS.use_document_title,
-      update_answer_coordinates=FLAGS.update_answer_coordinates,
-      drop_rows_to_fit=FLAGS.drop_rows_to_fit,
       max_column_id=_MAX_TABLE_ID,
       max_row_id=_MAX_TABLE_ID,
       strip_column_names=False,
@@ -383,7 +346,7 @@ def _train_and_predict(
   if task == tasks.Task.SQA:
     num_aggregation_labels = 0
     num_classification_labels = 0
-    use_answer_as_supervision = False
+    use_answer_as_supervision = None
   elif task in [
       tasks.Task.WTQ, tasks.Task.WIKISQL, tasks.Task.WIKISQL_SUPERVISED
   ]:
@@ -394,10 +357,6 @@ def _train_and_predict(
     num_classification_labels = 2
     num_aggregation_labels = 0
     use_answer_as_supervision = True
-  elif task == tasks.Task.NQ_RETRIEVAL:
-    num_aggregation_labels = 0
-    num_classification_labels = 2
-    use_answer_as_supervision = False
   else:
     raise ValueError(f'Unknown task: {task.name}')
 
@@ -419,12 +378,6 @@ def _train_and_predict(
     num_warmup_steps = int(num_train_steps * hparams['warmup_ratio'])
 
   bert_config = modeling.BertConfig.from_json_file(bert_config_file)
-  if 'bert_config_attention_probs_dropout_prob' in hparams:
-    bert_config.attention_probs_dropout_prob = hparams.get(
-        'bert_config_attention_probs_dropout_prob')
-  if 'bert_config_hidden_dropout_prob' in hparams:
-    bert_config.hidden_dropout_prob = hparams.get(
-        'bert_config_hidden_dropout_prob')
   tapas_config = tapas_classifier_model.TapasClassifierConfig(
       bert_config=bert_config,
       init_checkpoint=init_checkpoint,
@@ -444,8 +397,8 @@ def _train_and_predict(
       agg_temperature=1.0,
       use_gumbel_for_cells=False,
       use_gumbel_for_agg=False,
-      average_approximation_function=(
-          tapas_classifier_model.AverageApproximationFunction.RATIO),
+      average_approximation_function=tapas_classifier_model.\
+        AverageApproximationFunction.RATIO,
       cell_select_pref=hparams.get('cell_select_pref'),
       answer_loss_cutoff=hparams.get('answer_loss_cutoff'),
       grad_clipping=hparams.get('grad_clipping'),
@@ -453,20 +406,12 @@ def _train_and_predict(
       max_num_rows=64,
       max_num_columns=32,
       average_logits_per_cell=False,
-      disable_per_token_loss=hparams.get('disable_per_token_loss', False),
-      mask_examples_without_labels=hparams.get('mask_examples_without_labels',
-                                               False),
-      init_cell_selection_weights_to_zero=(
-          hparams['init_cell_selection_weights_to_zero']),
+      init_cell_selection_weights_to_zero=\
+        hparams['init_cell_selection_weights_to_zero'],
       select_one_column=hparams['select_one_column'],
       allow_empty_column_selection=hparams['allow_empty_column_selection'],
-      span_prediction=tapas_classifier_model.SpanPredictionMode(
-          hparams.get('span_prediction',
-                      tapas_classifier_model.SpanPredictionMode.NONE)),
       disable_position_embeddings=False,
-      reset_output_cls=FLAGS.reset_output_cls,
-      reset_position_index_per_cell=FLAGS.reset_position_index_per_cell,
-      table_pruning_config_file=FLAGS.table_pruning_config_file)
+      reset_position_index_per_cell=FLAGS.reset_position_index_per_cell)
 
   model_fn = tapas_classifier_model.model_fn_builder(tapas_config)
 
@@ -564,8 +509,6 @@ def _train_and_predict(
         _print(f'Evaluation finished after training step {current_step}.')
         break
 
-      prev_checkpoint = checkpoint
-
   else:
     raise ValueError(f'Unexpected mode: {mode}.')
 
@@ -659,15 +602,23 @@ def _predict_for_set(
       add_classification_labels=do_model_classification,
       add_answer=use_answer_as_supervision,
       include_id=False)
+  
   result = estimator.predict(input_fn=predict_input_fn)
+  result, myresult = itertools.tee(result)
+  # print("# [debug] result is: \n{}".format(list(myresult)))
+  # write to outputs
+  with open("/content/tapas_on_visqa_outputs.pkl", "rb") as f:
+    dt = pickle.load(f)
+  dt.append(list(myresult))
+  with open("/content/tapas_on_visqa_outputs.pkl", "wb") as f:
+    pickle.dump(dt, f)
+
   exp_prediction_utils.write_predictions(
       result,
       prediction_file,
       do_model_aggregation=do_model_aggregation,
       do_model_classification=do_model_classification,
-      cell_classification_threshold=_CELL_CLASSIFICATION_THRESHOLD,
-      output_token_probabilities=False,
-      output_token_answers=True)
+      cell_classification_threshold=_CELL_CLASSIFICATION_THRESHOLD)
   tf.io.gfile.copy(prediction_file, other_prediction_file, overwrite=True)
 
 
@@ -688,7 +639,7 @@ def _predict_sequence_for_set(
       max_predictions_per_seq=_MAX_PREDICTIONS_PER_SEQ,
       add_aggregation_function_id=do_model_aggregation,
       add_classification_labels=False,
-      add_answer=use_answer_as_supervision)  # pytype: disable=wrong-arg-types
+      add_answer=use_answer_as_supervision)
   result = exp_prediction_utils.compute_prediction_sequence(
       estimator=estimator, examples_by_position=examples_by_position)
   exp_prediction_utils.write_predictions(
@@ -697,8 +648,7 @@ def _predict_sequence_for_set(
       do_model_aggregation,
       do_model_classification=False,
       cell_classification_threshold=_CELL_CLASSIFICATION_THRESHOLD,
-      output_token_probabilities=False,
-      output_token_answers=True)
+  )
   tf.io.gfile.copy(prediction_file, other_prediction_file, overwrite=True)
 
 
@@ -711,7 +661,6 @@ def _eval(
   """Evaluate dev and test predictions."""
   for test_set in TestSet:
     _eval_for_set(
-        model_dir=model_dir,
         name=test_set.name.lower(),
         task=task,
         interaction_file=_get_test_interactions_file(
@@ -730,7 +679,6 @@ def _eval(
     )
     if task == tasks.Task.SQA:
       _eval_for_set(
-          model_dir=model_dir,
           name=f'{test_set.name.lower()}_seq',
           task=task,
           interaction_file=_get_test_interactions_file(
@@ -750,7 +698,6 @@ def _eval(
 
 
 def _eval_for_set(
-    model_dir,
     name,
     task,
     interaction_file,
@@ -776,38 +723,10 @@ def _eval_for_set(
         denotation_errors_path=None,
         predictions_file_name=None,
     )
-    if global_step is not None:
-      _create_measurements_for_metrics(
-          {'denotation_accuracy': denotation_accuracy},
-          global_step=global_step,
-          model_dir=model_dir,
-          name=name,
-      )
+    _print(f'{name} denotation accuracy: {denotation_accuracy:0.4f}')
   elif task == tasks.Task.TABFACT:
     accuracy = calc_metrics_utils.calc_classification_accuracy(test_examples)
-    if global_step is not None:
-      _create_measurements_for_metrics(
-          {'accuracy': accuracy},
-          global_step=global_step,
-          model_dir=model_dir,
-          name=name,
-      )
-  elif task == tasks.Task.NQ_RETRIEVAL:
-    e2e_metrics = e2e_eval_utils.evaluate_retrieval_e2e(
-        interaction_file=interaction_file,
-        prediction_file=prediction_file,
-        vocab_file=FLAGS.bert_vocab_file,
-    ).to_dict()
-    e2e_metrics = {
-        key: val for key, val in e2e_metrics.items() if val is not None
-    }
-    if global_step is not None:
-      _create_measurements_for_metrics(
-          e2e_metrics,
-          global_step=global_step,
-          model_dir=model_dir,
-          name=name,
-      )
+    _print(f'{name} accuracy: {accuracy:0.4f}')
   else:
     raise ValueError(f'Unknown task: {task.name}')
 
@@ -854,12 +773,10 @@ def main(argv):
   _check_options(output_dir, task, mode)
 
   if mode == Mode.CREATE_DATA:
-    # Retrieval interactions are model dependant and are created in advance.
-    if task != tasks.Task.NQ_RETRIEVAL:
-      _print('Creating interactions ...')
-      token_selector = _get_token_selector()
-      task_utils.create_interactions(task, FLAGS.input_dir, output_dir,
-                                     token_selector)
+    _print('Creating interactions ...')
+    token_selector = _get_token_selector()
+    task_utils.create_interactions(task, FLAGS.input_dir, output_dir,
+                                   token_selector)
     _print('Creating TF examples ...')
     _create_all_examples(
         task,
